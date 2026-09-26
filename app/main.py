@@ -8,8 +8,16 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .assessment import AssessmentError, assess, get_timezone
+from .background import assess_background
 from .sampling import plan_sampling
-from .schemas import AssessRequest, AssessResponse, SamplingPlanRequest, SamplingPlanResponse
+from .schemas import (
+    AssessRequest,
+    AssessResponse,
+    BackgroundAssessRequest,
+    BackgroundAssessResponse,
+    SamplingPlanRequest,
+    SamplingPlanResponse,
+)
 
 app = FastAPI(
     title="夜间施工噪声核算 API",
@@ -74,6 +82,24 @@ async def assess_noise(req: AssessRequest) -> AssessResponse:
         limit_db=req.limit_db,
     )
     return AssessResponse.from_assessment(result, readings_count=len(req.readings))
+
+
+@app.post(
+    "/background-assess",
+    response_model=BackgroundAssessResponse,
+    tags=["噪声核算"],
+    summary="扣除背景噪声后核算夜间施工声级 Leq 并判定是否超限",
+)
+async def assess_background_noise(req: BackgroundAssessRequest) -> BackgroundAssessResponse:
+    tz = get_timezone(req.timezone)
+    result = assess_background(
+        timezone=tz,
+        night_date=req.night_date,
+        total_raw=[(r.time, r.db) for r in req.total_readings],
+        background_raw=[(r.time, r.db) for r in req.background_readings],
+        limit_db=req.limit_db,
+    )
+    return BackgroundAssessResponse.from_assessment(result)
 
 
 @app.post(

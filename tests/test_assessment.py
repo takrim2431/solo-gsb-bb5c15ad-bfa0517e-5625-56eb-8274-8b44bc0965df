@@ -166,9 +166,10 @@ def test_dst_spring_forward_window_shortened():
     assert elapsed(w.start, w.end) == timedelta(hours=7)
 
     # 用 UTC 绝对时刻每 10 分钟一个读数覆盖该窗口
-    start = w.start - timedelta(minutes=10)
-    end = w.end + timedelta(minutes=10)
-    n = round((end - start) / timedelta(minutes=10)) + 1
+    # （不能用挂钟时间做等差：春令时跳过的 02:00–03:00 在当地并不存在）
+    start = w.start.astimezone(timezone.utc) - timedelta(minutes=10)
+    end = w.end.astimezone(timezone.utc) + timedelta(minutes=10)
+    n = round(elapsed(start, end).total_seconds() / 600) + 1
     readings = [(start + timedelta(minutes=10 * i), 55.0) for i in range(n)]
     res = assess(ny, d, readings, limit_db=55.0)
     assert res.sufficient

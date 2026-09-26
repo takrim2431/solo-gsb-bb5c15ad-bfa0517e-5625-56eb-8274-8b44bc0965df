@@ -260,3 +260,201 @@ def test_sampling_plan_missing_field_400():
     r = client.post("/sampling-plan", json={"timezone": "Asia/Shanghai"})
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "invalid_request"
+
+
+# ---------- POST /background-assess ----------
+
+
+def bg_payload(total_level=60.0, bg_level=50.0, step_min=10, **overrides):
+    def series(level):
+        start = at(-step_min / 60)
+        n = int((8 * 60 + 2 * step_min) / step_min) + 1
+        return [
+            {"time": (start + timedelta(minutes=step_min * i)).isoformat(), "db": level}
+            for i in range(n)
+        ]
+
+    p = {
+        "timezone": "Asia/Shanghai",
+        "night_date": "2026-09-25",
+        "limit_db": 55.0,
+        "total_readings": series(total_level),
+        "background_readings": series(bg_level),
+    }
+    p.update(overrides)
+    return p
+
+
+def test_background_assess_sufficient():
+    r = client.post("/background-assess", json=bg_payload())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["sufficient"] is True
+    # 10 lg(10^6 - 10^5) = 59.5424...
+    assert body["leq"] == 59.54
+    assert body["exceeds"] is True
+    assert body["conclusion"] == "超限"
+    assert body["limit_db"] == 55.0
+    assert body["total_readings_count"] == 51
+    assert body["background_readings_count"] == 51
+    assert body["window"]["duration_seconds"] == 28800
+    assert len(body["segments"]) == 48
+    seg = body["segments"][0]
+    assert seg["total_db"] == 60.0
+    assert seg["background_db"] == 50.0
+    assert seg["start"] == "2026-09-25T22:00:00+08:00"
+    assert seg["end"] == "2026-09-25T22:10:00+08:00"
+    assert seg["duration_seconds"] == 600.0
+
+
+def test_background_assess_not_exceeding():
+    # 总 56 / 背景 55 → 残余 Leq ≈ 49.13，低于限值 50
+    r = client.post("/background-assess", json=bg_payload(56.0, 55.0, limit_db=50.0))
+    body = r.json()
+    assert body["sufficient"] is True
+    assert body["exceeds"] is False
+    assert body["conclusion"] == "未超限"
+
+
+def test_background_assess_merged_segments():
+    # 背景序列 21:45 起每 15 分钟：合并后 64 段
+    def bg_series():
+        start = at(-0.25)
+        return [
+            {"time": (start + timedelta(minutes=15 * i)).isoformat(), "db": 50.0}
+            for i in range(int(8.5 * 60 / 15) + 1)
+        ]
+
+    p = bg_payload()
+    p["background_readings"] = bg_series()
+    r = client.post("/background-assess", json=p)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["sufficient"] is True
+    assert len(body["segments"]) == 64
+    assert sum(s["duration_seconds"] for s in body["segments"]) == 28800.0
+    # 段首尾相接
+    for prev, cur in zip(body["segments"], body["segments"][1:]):
+        assert prev["end"] == cur["start"]
+
+
+def test_background_assess_non_positive_energy():
+    # 总 == 背景：每段 E=0，不跳过，Leq/超限为 null
+    r = client.post("/background-assess", json=bg_payload(55.0, 55.0))
+    body = r.json()
+    assert body["sufficient"] is False
+    assert body["conclusion"] == "数据不足"
+    assert body["reason_code"] == "background_exceeds_total"
+    assert body["leq"] is None
+    assert body["exceeds"] is None
+    assert body["limit_db"] is None
+    assert len(body["segments"]) == 48
+    assert all(s["residual_energy"] is None for s in body["segments"])
+    assert "背景" in body["reason"]
+
+
+def test_background_assess_head_not_covered():
+    p = bg_payload()
+    p["background_readings"] = p["background_readings"][2:]  # 背景首点 22:10
+    r = client.post("/background-assess", json=p)
+    body = r.json()
+    assert body["sufficient"] is False
+    assert body["reason_code"] == "head_not_covered"
+    assert body["leq"] is None
+    assert body["exceeds"] is None
+
+
+def test_background_assess_tail_not_covered():
+    p = bg_payload()
+    p["total_readings"] = p["total_readings"][:-2]  # 总末点 05:50
+    r = client.post("/background-assess", json=p)
+    body = r.json()
+    assert body["sufficient"] is False
+    assert body["reason_code"] == "tail_not_covered"
+
+
+def test_background_assess_gap_too_large():
+    # 背景 15 分钟网格（21:45..06:15），02:00 之后整体后移 1 分钟：
+    # 02:00→02:16 形成 16 分钟空档，末点变为 06:16 仍覆盖尾端
+    start = at(-0.25)
+    n = int((8 * 60 + 2 * 15) / 15) + 1
+    bg = [
+        {"time": (start + timedelta(minutes=15 * i)).isoformat(), "db": 50.0}
+        for i in range(n)
+    ]
+    split = at(4)
+    for rd in bg:
+        if datetime.fromisoformat(rd["time"]) > split:
+            rd["time"] = (datetime.fromisoformat(rd["time"]) + timedelta(minutes=1)).isoformat()
+    p = bg_payload()
+    p["background_readings"] = bg
+    r = client.post("/background-assess", json=p)
+    assert r.json()["reason_code"] == "gap_too_large"
+
+
+def test_background_assess_naive_time_400():
+    p = bg_payload()
+    p["background_readings"][0]["time"] = "2026-09-25T21:50:00"
+    r = client.post("/background-assess", json=p)
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_request"
+
+
+def test_background_assess_duplicate_400():
+    p = bg_payload()
+    p["total_readings"][5]["time"] = p["total_readings"][4]["time"]
+    r = client.post("/background-assess", json=p)
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "duplicate_timestamp"
+
+
+def test_background_assess_bool_db_400():
+    p = bg_payload()
+    p["total_readings"][0]["db"] = True
+    r = client.post("/background-assess", json=p)
+    assert r.status_code == 400
+
+
+def test_background_assess_bad_timezone_400():
+    r = client.post("/background-assess", json=bg_payload(timezone="Mars/Olympus"))
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_timezone"
+
+
+def test_background_assess_empty_and_missing_field_400():
+    p = bg_payload()
+    p["total_readings"] = []
+    r = client.post("/background-assess", json=p)
+    assert r.status_code == 400
+
+    p = bg_payload()
+    del p["background_readings"]
+    r = client.post("/background-assess", json=p)
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "invalid_request"
+
+
+def test_background_assess_dst_fall_back():
+    # 美东 2026-11-01 回拨：夜间窗口实际 9 小时（UTC 01:00→11:00）
+    def ny_series(level):
+        start = datetime(2026, 11, 1, 1, 50, tzinfo=timezone.utc)  # NY 21:50 EDT
+        return [
+            {"time": (start + timedelta(minutes=10 * i)).isoformat(), "db": level}
+            for i in range(57)  # 至窗口结束后 10 分钟（NY 06:10 EST）
+        ]
+
+    p = {
+        "timezone": "America/New_York",
+        "night_date": "2026-10-31",
+        "limit_db": 55.0,
+        "total_readings": ny_series(60.0),
+        "background_readings": ny_series(50.0),
+    }
+    r = client.post("/background-assess", json=p)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["sufficient"] is True
+    assert body["window"]["duration_seconds"] == 32400.0
+    assert body["window"]["start"] == "2026-10-31T22:00:00-04:00"
+    assert body["window"]["end"] == "2026-11-01T06:00:00-05:00"
+    assert sum(s["duration_seconds"] for s in body["segments"]) == 32400.0

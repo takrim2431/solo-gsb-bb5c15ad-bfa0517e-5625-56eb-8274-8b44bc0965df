@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+UTC = timezone.utc
 
 NIGHT_START = time(22, 0)       # 当地夜间起始 22:00
 NIGHT_END = time(6, 0)          # 当地夜间结束 次日 06:00
@@ -98,6 +100,95 @@ def night_window(timezone: ZoneInfo, night_date: date) -> Window:
     return Window(start=start, end=end)
 
 
+def normalize_readings(
+    raw_readings: list[tuple[datetime, float]],
+    *,
+    label: str = "读数",
+) -> list[Reading] | None:
+    """校验并规整单条读数序列：
+
+    - 少于 2 条返回 None（调用方据此给 insufficient_readings 结论）；
+    - 时间必须带时区偏移，序列须按绝对时刻严格递增，否则抛 AssessmentError；
+    - 内部统一换算为 UTC 后参与比较——Python 的 aware datetime 排序在
+      回拨夜混合 tzinfo 时可能出错（fold 歧义），统一时区可规避；
+    - label 用于区分总噪声 / 背景噪声序列的错误信息。
+    """
+    if len(raw_readings) < 2:
+        return None
+
+    readings: list[Reading] = []
+    for t, level in raw_readings:
+        if t.tzinfo is None or t.utcoffset() is None:
+            raise AssessmentError(
+                "naive_timestamp", f"{label}时间缺少时区偏移：{t.isoformat()}"
+            )
+        readings.append(Reading(t=t, level=float(level)))
+
+    # 拒绝重复时间与乱序。必须按原始 aware datetime 比较、不能先换算到 UTC：
+    # 春令时当晚若用挂钟时间做等差构造，读数会落到不存在的 02:xx（Python 归一
+    # 后与下一条得到同一绝对时刻），其挂钟分量不同、属合法的两笔读数；而真正
+    # 的重复输入挂钟分量也相同。任何逆序必出现在相邻对中。
+    for (raw_t, _), prev, cur in zip(raw_readings[1:], readings, readings[1:]):
+        if cur.t == prev.t:
+            raise AssessmentError(
+                "duplicate_timestamp", f"{label}时间重复：{raw_t.isoformat()}"
+            )
+        if cur.t < prev.t:
+            raise AssessmentError(
+                "out_of_order",
+                f"{label}时间乱序：{raw_t.isoformat()} 早于前一读数",
+            )
+
+    # 校验通过后再统一换算到 UTC：回拨夜混合不同 tzinfo 时 aware datetime 的
+    # 直接比较会受 fold 歧义影响，统一时区后一律按绝对时刻处理（含夏令时）。
+    return [Reading(t=r.t.astimezone(UTC), level=r.level) for r in readings]
+
+
+def coverage_reason(readings: list[Reading], window: Window) -> Reason | None:
+    """检查单条读数序列对夜间窗口的首尾覆盖与 15 分钟间隔。
+
+    未通过时返回原因代码；通过返回 None。窗口之外（白天）的大间隔不参与判定。
+    读数已统一为 UTC，窗口边界同样按 UTC 比较。
+    """
+    win_start = window.start.astimezone(UTC)
+    win_end = window.end.astimezone(UTC)
+    if readings[0].t > win_start:
+        return "head_not_covered"
+    if readings[-1].t < win_end:
+        return "tail_not_covered"
+    for prev, cur in zip(readings, readings[1:]):
+        clip_start = max(prev.t, win_start)
+        clip_end = min(cur.t, win_end)
+        if clip_end <= clip_start:
+            continue  # 该区间与窗口无正重叠
+        if elapsed(prev.t, cur.t) > MAX_GAP:
+            return "gap_too_large"
+    return None
+
+
+def clipped_segments(readings: list[Reading], window: Window) -> list[Segment]:
+    """把相邻读数区间裁剪到夜间窗口，声级以前一读数代表。读数与窗口均按 UTC 比较。"""
+    tz = window.start.tzinfo
+    win_start = window.start.astimezone(UTC)
+    win_end = window.end.astimezone(UTC)
+    segments: list[Segment] = []
+    for prev, cur in zip(readings, readings[1:]):
+        clip_start = max(prev.t, win_start)
+        clip_end = min(cur.t, win_end)
+        if clip_end <= clip_start:
+            continue  # 该区间与窗口无正重叠
+        duration = elapsed(clip_start, clip_end).total_seconds()
+        segments.append(
+            Segment(
+                start=clip_start.astimezone(tz),
+                end=clip_end.astimezone(tz),
+                level_db=prev.level,
+                duration_seconds=duration,
+            )
+        )
+    return segments
+
+
 def assess(
     timezone: ZoneInfo,
     night_date: date,
@@ -111,53 +202,16 @@ def assess(
     """
     window = night_window(timezone, night_date)
 
-    if len(raw_readings) < 2:
+    readings = normalize_readings(raw_readings)
+    if readings is None:
         return Assessment(False, window, reason="insufficient_readings")
 
-    readings: list[Reading] = []
-    for t, level in raw_readings:
-        if t.tzinfo is None or t.utcoffset() is None:
-            raise AssessmentError("naive_timestamp", f"读数时间缺少时区偏移：{t.isoformat()}")
-        readings.append(Reading(t=t, level=float(level)))
-
-    # 拒绝重复时间与乱序（相邻比较即可覆盖：任何逆序/重复必出现在相邻对中）
-    for prev, cur in zip(readings, readings[1:]):
-        if cur.t == prev.t:
-            raise AssessmentError(
-                "duplicate_timestamp", f"读数时间重复：{cur.t.isoformat()}"
-            )
-        if cur.t < prev.t:
-            raise AssessmentError(
-                "out_of_order",
-                f"读数时间乱序：{cur.t.isoformat()} 早于前一读数 {prev.t.isoformat()}",
-            )
-
-    first, last = readings[0], readings[-1]
-
     # 窗口首尾必须被覆盖（读数区间 [first.t, last.t] 需覆盖整个窗口）
-    if first.t > window.start:
-        return Assessment(False, window, reason="head_not_covered")
-    if last.t < window.end:
-        return Assessment(False, window, reason="tail_not_covered")
+    reason = coverage_reason(readings, window)
+    if reason is not None:
+        return Assessment(False, window, reason=reason)
 
-    segments: list[Segment] = []
-    for prev, cur in zip(readings, readings[1:]):
-        clip_start = max(prev.t, window.start)
-        clip_end = min(cur.t, window.end)
-        if clip_end <= clip_start:
-            continue  # 该区间与窗口无正重叠
-        gap = elapsed(prev.t, cur.t)
-        if gap > MAX_GAP:
-            return Assessment(False, window, reason="gap_too_large")
-        duration = elapsed(clip_start, clip_end).total_seconds()
-        segments.append(
-            Segment(
-                start=clip_start.astimezone(timezone),
-                end=clip_end.astimezone(timezone),
-                level_db=prev.level,
-                duration_seconds=duration,
-            )
-        )
+    segments = clipped_segments(readings, window)
 
     covered = sum(s.duration_seconds for s in segments)
     window_duration = elapsed(window.start, window.end).total_seconds()
