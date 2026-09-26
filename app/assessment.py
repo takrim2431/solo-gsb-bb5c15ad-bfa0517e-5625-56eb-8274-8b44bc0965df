@@ -98,21 +98,20 @@ def night_window(timezone: ZoneInfo, night_date: date) -> Window:
     return Window(start=start, end=end)
 
 
-def assess(
-    timezone: ZoneInfo,
-    night_date: date,
+def check_coverage(
     raw_readings: list[tuple[datetime, float]],
-    limit_db: float,
-) -> Assessment:
-    """按规范核算夜间等效声级。
+    window: Window,
+    timezone: ZoneInfo,
+) -> tuple[list[Segment], Reason | None]:
+    """校验单组读数对夜间窗口的覆盖充分性，并裁剪出窗口分段。
 
-    读数以绝对时刻（带偏移量的 datetime）给出，可处于任意时区，
-    内部统一按绝对时刻参与裁剪与比较。
+    返回 (segments, reason)：reason 为 None 表示数据充分，segments 完整
+    覆盖整个窗口；否则 reason 指明不足原因（首尾/数量/间隔不足时 segments
+    为空；incomplete_coverage 兜底时返回已裁出的部分分段）。
+    输入语义不合法（缺时区偏移、重复、乱序）时抛 AssessmentError。
     """
-    window = night_window(timezone, night_date)
-
     if len(raw_readings) < 2:
-        return Assessment(False, window, reason="insufficient_readings")
+        return [], "insufficient_readings"
 
     readings: list[Reading] = []
     for t, level in raw_readings:
@@ -136,9 +135,9 @@ def assess(
 
     # 窗口首尾必须被覆盖（读数区间 [first.t, last.t] 需覆盖整个窗口）
     if first.t > window.start:
-        return Assessment(False, window, reason="head_not_covered")
+        return [], "head_not_covered"
     if last.t < window.end:
-        return Assessment(False, window, reason="tail_not_covered")
+        return [], "tail_not_covered"
 
     segments: list[Segment] = []
     for prev, cur in zip(readings, readings[1:]):
@@ -148,7 +147,7 @@ def assess(
             continue  # 该区间与窗口无正重叠
         gap = elapsed(prev.t, cur.t)
         if gap > MAX_GAP:
-            return Assessment(False, window, reason="gap_too_large")
+            return [], "gap_too_large"
         duration = elapsed(clip_start, clip_end).total_seconds()
         segments.append(
             Segment(
@@ -163,9 +162,30 @@ def assess(
     window_duration = elapsed(window.start, window.end).total_seconds()
     if not segments or not math.isclose(covered, window_duration, abs_tol=1.0):
         # 兜底：正常情况下首尾覆盖已保证完整覆盖
-        return Assessment(False, window, segments=segments, reason="incomplete_coverage")
+        return segments, "incomplete_coverage"
+
+    return segments, None
+
+
+def assess(
+    timezone: ZoneInfo,
+    night_date: date,
+    raw_readings: list[tuple[datetime, float]],
+    limit_db: float,
+) -> Assessment:
+    """按规范核算夜间等效声级。
+
+    读数以绝对时刻（带偏移量的 datetime）给出，可处于任意时区，
+    内部统一按绝对时刻参与裁剪与比较。
+    """
+    window = night_window(timezone, night_date)
+
+    segments, reason = check_coverage(raw_readings, window, timezone)
+    if reason is not None:
+        return Assessment(False, window, segments=segments, reason=reason)
 
     # 能量法等效声级：Leq = 10 lg( Σ wᵈ 10^(Lᵢ/10) / Σ wᵈ )
+    window_duration = elapsed(window.start, window.end).total_seconds()
     try:
         energy_sum = sum(
             seg.duration_seconds * math.pow(10.0, seg.level_db / 10.0) for seg in segments

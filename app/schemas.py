@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .assessment import Assessment, Segment, Window, elapsed
+from .background import BackgroundAssessment
 
 
 class ReadingIn(BaseModel):
@@ -42,6 +43,28 @@ class AssessRequest(BaseModel):
     night_date: date = Field(..., description="夜间起始日期（当地日历日，窗口为该日 22:00 至次日 06:00）")
     limit_db: float = Field(..., description="夜间噪声限值（dBA），Leq 严格大于该值判定为超限")
     readings: list[ReadingIn] = Field(..., min_length=1, description="按时间排列的带时分贝读数")
+
+    @field_validator("limit_db", mode="before")
+    @classmethod
+    def _limit_must_be_numeric(cls, v):
+        if isinstance(v, bool):
+            raise ValueError("限值必须是数值，不能是布尔值")
+        return v
+
+    @field_validator("limit_db")
+    @classmethod
+    def _limit_must_be_finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("限值必须是有限数值")
+        return v
+
+
+class BackgroundAssessRequest(BaseModel):
+    timezone: str = Field(..., description="施工地 IANA 时区，如 Asia/Shanghai", examples=["Asia/Shanghai"])
+    night_date: date = Field(..., description="夜间起始日期（当地日历日，窗口为该日 22:00 至次日 06:00）")
+    limit_db: float = Field(..., description="夜间施工噪声限值（dBA），Leq 严格大于该值判定为超限")
+    total_readings: list[ReadingIn] = Field(..., min_length=1, description="按时间排列的总噪声（施工+背景）带时分贝读数")
+    background_readings: list[ReadingIn] = Field(..., min_length=1, description="按时间排列的背景噪声带时分贝读数")
 
     @field_validator("limit_db", mode="before")
     @classmethod
@@ -144,6 +167,76 @@ class AssessResponse(BaseModel):
                 duration_seconds=elapsed(window.start, window.end).total_seconds(),
             ),
             readings_count=readings_count,
+            segments=segments,
+            leq=round(result.leq, 2),  # type: ignore[arg-type]
+            limit_db=result.limit_db,
+            exceeds=result.exceeds,
+            conclusion="超限" if result.exceeds else "未超限",
+        )
+
+
+class AlignedSegmentOut(BaseModel):
+    start: datetime
+    end: datetime
+    duration_seconds: float
+    total_db: float = Field(..., description="该段总噪声代表声级（取总噪声序列段首前一读数，dBA）")
+    background_db: float = Field(..., description="该段背景噪声代表声级（取背景噪声序列段首前一读数，dBA）")
+    energy: float = Field(..., description="扣除背景后的施工声能权重 E = 10^(总/10) − 10^(背/10)")
+
+
+class BackgroundAssessResponse(BaseModel):
+    sufficient: bool = Field(..., description="数据是否充分且各段扣除背景后声能均为正")
+    window: WindowOut
+    total_readings_count: int
+    background_readings_count: int
+    segments: list[AlignedSegmentOut]
+    leq: float | None = Field(None, description="施工声级等效声级（dBA，保留两位小数）；无法核算时为 null")
+    limit_db: float | None = None
+    exceeds: bool | None = Field(None, description="Leq 是否严格超过限值；无法核算时为 null")
+    conclusion: str | None = Field(None, description="结论：超限 / 未超限 / 数据不足 / 无法核算")
+    reason_code: str | None = Field(None, description="无法核算原因代码")
+    reason: str | None = Field(None, description="无法核算原因说明")
+
+    @classmethod
+    def from_assessment(
+        cls,
+        result: BackgroundAssessment,
+        total_readings_count: int,
+        background_readings_count: int,
+    ) -> "BackgroundAssessResponse":
+        window = result.window
+        segments = [
+            AlignedSegmentOut(
+                start=s.start,
+                end=s.end,
+                duration_seconds=round(s.duration_seconds, 3),
+                total_db=s.total_db,
+                background_db=s.background_db,
+                energy=s.energy,
+            )
+            for s in result.segments
+        ]
+        window_out = WindowOut(
+            start=window.start,
+            end=window.end,
+            duration_seconds=elapsed(window.start, window.end).total_seconds(),
+        )
+        if not result.sufficient:
+            return cls(
+                sufficient=False,
+                window=window_out,
+                total_readings_count=total_readings_count,
+                background_readings_count=background_readings_count,
+                segments=segments,
+                conclusion="无法核算" if result.reason == "background_not_below_total" else "数据不足",
+                reason_code=result.reason,
+                reason=result.reason_text,
+            )
+        return cls(
+            sufficient=True,
+            window=window_out,
+            total_readings_count=total_readings_count,
+            background_readings_count=background_readings_count,
             segments=segments,
             leq=round(result.leq, 2),  # type: ignore[arg-type]
             limit_db=result.limit_db,

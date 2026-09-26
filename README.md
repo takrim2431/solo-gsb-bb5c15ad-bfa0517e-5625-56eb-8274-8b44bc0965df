@@ -1,6 +1,6 @@
 # 夜间施工噪声核算 API
 
-基于 Python + FastAPI 的夜间施工噪声等效声级（Leq）核算与采样补点规划服务。
+基于 Python + FastAPI 的夜间施工噪声等效声级（Leq）核算、背景噪声扣除与采样补点规划服务。
 
 按施工当地 **22:00 至次日 06:00** 的夜间窗口，对相邻带时分贝读数覆盖的时段进行裁剪；
 每段以**前一读数**为代表声级，按持续秒数对声能 10^(dBA/10) 加权，计算时间加权等效声级：
@@ -10,6 +10,10 @@ Leq = 10 · lg( Σ (Δtᵢ · 10^(Lᵢ/10)) / Σ Δtᵢ )
 ```
 
 并与噪声限值比较，给出 **超限 / 未超限 / 数据不足** 的结论。
+
+亦可用同一夜间的**总噪声**与**背景噪声**两组读数估算施工声级：两组读数分别独立满足
+首尾覆盖与 15 分钟间隔约束后，按两者全部分段边界合并切段，逐段以
+E = 10^(L总/10) − 10^(L背/10) 扣除背景，再按真实秒数加权求整夜施工 Leq。
 
 此外提供采样补点规划接口：在已有采样时刻的基础上，为夜间窗口生成**最少数量**的新增采样时刻，
 使窗口首尾被覆盖、且所有与窗口有正重叠的相邻采样间隔不超过 15 分钟。
@@ -49,6 +53,7 @@ docker compose down
 - 服务地址：`http://localhost:8000`（使用 `HOST_PORT` 时替换端口）
 - 健康检查：`GET http://localhost:8000/health`
 - 噪声核算：`POST http://localhost:8000/assess`
+- 背景扣除核算：`POST http://localhost:8000/background-assess`
 - 采样补点规划：`POST http://localhost:8000/sampling-plan`
 - 交互文档（Swagger UI）：`http://localhost:8000/docs`
 - OpenAPI 描述：`http://localhost:8000/openapi.json`
@@ -165,6 +170,121 @@ PY
 { "error": { "code": "out_of_order", "message": "读数时间乱序：..." } }
 ```
 
+## 背景噪声扣除（POST /background-assess）
+
+用同一夜间的**总噪声**（施工+背景）与**背景噪声**两组读数，估算夜间施工声级 Leq。
+
+### 请求
+
+`POST /background-assess`，`Content-Type: application/json`：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `timezone` | string | 施工地 **IANA 时区**，如 `Asia/Shanghai`、`America/New_York` |
+| `night_date` | string | 夜间**起始日期**（`YYYY-MM-DD`，当地日历日），窗口为该日 22:00 至次日 06:00 |
+| `limit_db` | number | 夜间施工噪声限值（dBA）；Leq **严格大于**该值判定为超限（等于不算超限） |
+| `total_readings` | array | 总噪声读数，至少 1 条；元素含 `time` 与 `db`，格式与校验同 `/assess` 的 `readings` |
+| `background_readings` | array | 背景噪声读数，至少 1 条；格式与校验同上 |
+
+### 核算规则
+
+- 两组读数**分别独立**满足与 `/assess` 相同的输入校验与覆盖要求
+  （首尾覆盖窗口、窗口内相邻间隔 ≤ 15 分钟，恰好 15 分钟允许）；
+- 按两组分段的**全部边界**合并切段，每段的总/背景声级**各取各自序列的前一读数**；
+- 每段扣除背景：E = 10^(L总/10) − 10^(L背/10)，整夜施工 Leq = 10 · lg( Σ Δtᵢ·Eᵢ / Σ Δtᵢ )，
+  各段时长按**真实秒数**计权（夏令时跳变/回拨当晚分别为 7 / 9 小时）；
+- 以**未舍入** Leq 严格大于限值判超限，返回的 Leq 保留两位小数；
+- 任一序列覆盖不足，或任一段 E ≤ 0（背景噪声不低于总噪声）时：`leq` / `exceeds` 为 `null`，
+  并给出具体 `reason_code` 与中文 `reason`；对齐分段仍**完整返回，不跳过问题段**。
+
+### 无法核算的原因代码（`reason_code`）
+
+- 覆盖不足：`total_` / `background_` 前缀加 `/assess` 的同名原因，如
+  `total_head_not_covered`、`background_tail_not_covered`、`background_gap_too_large`、
+  `total_insufficient_readings` 等（此时 `conclusion` 为 `"数据不足"`）；
+- `background_not_below_total`：存在背景噪声不低于总噪声的对齐分段，扣除后声能不为正
+  （此时 `conclusion` 为 `"无法核算"`）。
+
+### 响应
+
+数据充分时 HTTP 200：
+
+```json
+{
+  "sufficient": true,
+  "window": {
+    "start": "2026-09-25T22:00:00+08:00",
+    "end": "2026-09-26T06:00:00+08:00",
+    "duration_seconds": 28800.0
+  },
+  "total_readings_count": 51,
+  "background_readings_count": 51,
+  "segments": [
+    {
+      "start": "2026-09-25T22:00:00+08:00",
+      "end": "2026-09-25T22:10:00+08:00",
+      "duration_seconds": 600.0,
+      "total_db": 60.0,
+      "background_db": 50.0,
+      "energy": 900000.0
+    }
+  ],
+  "leq": 59.54,
+  "limit_db": 55.0,
+  "exceeds": true,
+  "conclusion": "超限"
+}
+```
+
+无法核算时同样返回 HTTP 200，`sufficient=false`，`leq` / `exceeds` 为 `null`：
+
+```json
+{
+  "sufficient": false,
+  "window": { "start": "...", "end": "...", "duration_seconds": 28800.0 },
+  "total_readings_count": 51,
+  "background_readings_count": 51,
+  "segments": [ ],
+  "leq": null,
+  "limit_db": null,
+  "exceeds": null,
+  "conclusion": "数据不足",
+  "reason_code": "background_gap_too_large",
+  "reason": "背景噪声读数在夜间窗口内存在相邻间隔超过 15 分钟"
+}
+```
+
+输入合法性规则（HTTP 400）与 `/assess` 一致，对两组读数分别生效
+（乱序 `out_of_order`、重复 `duplicate_timestamp`、非数值声级 / 缺时区偏移 `invalid_request`、
+无法识别的时区 `invalid_timezone`）。
+
+### 示例
+
+```bash
+curl -X POST http://localhost:8000/background-assess \
+  -H 'Content-Type: application/json' \
+  -d "$(python3 - <<'PY'
+import json
+from datetime import datetime, timedelta, timezone
+start = datetime(2026, 9, 25, 13, 50, tzinfo=timezone.utc)  # 北京 21:50
+def series(level):
+    return [
+        {"time": (start + timedelta(minutes=10*i)).isoformat(), "db": level}
+        for i in range(51)   # 至北京次日 06:10
+    ]
+print(json.dumps({
+    "timezone": "Asia/Shanghai",
+    "night_date": "2026-09-25",
+    "limit_db": 55,
+    "total_readings": series(60),
+    "background_readings": series(50),
+}))
+PY
+)"
+```
+
+恒总噪声 60 dBA、恒背景 50 dBA 时返回 `"leq": 59.54, "exceeds": true, "conclusion": "超限"`。
+
 ## 采样补点规划（POST /sampling-plan）
 
 在已有采样时刻的基础上，为当地 22:00–次日 06:00 的夜间窗口生成**最少数量**的新增采样时刻（补点）。
@@ -242,9 +362,10 @@ curl -X POST http://localhost:8000/sampling-plan \
 app/
   main.py          # FastAPI 入口、路由与异常处理
   assessment.py    # 窗口裁剪、数据充分性校验、Leq 核心算法
+  background.py    # 总噪声扣除背景噪声的对齐切段与施工声级核算
   sampling.py      # 夜间窗口最少补点规划算法
   schemas.py       # 请求/响应模型
-tests/             # 核心算法与 HTTP 接口测试（共 57 例）
+tests/             # 核心算法与 HTTP 接口测试（共 86 例）
 Dockerfile
 docker-compose.yml
 requirements.txt
